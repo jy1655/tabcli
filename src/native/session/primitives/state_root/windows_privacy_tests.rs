@@ -13,7 +13,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC, WRITE_OWNER},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
+    Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
     Security::*,
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -109,7 +109,7 @@ impl SavedAccess {
         unsafe {
             LocalFree(text.cast());
         }
-        value
+        value.trim_end_matches('\0').to_owned()
     }
     fn restore_dacl(&self) {
         assert_eq!(
@@ -224,13 +224,6 @@ fn windows_state_root_owners_and_dacl() {
         if case != "accepted" {
             assert!(!account.owners.iter().any(|sid| sid == administrators));
         }
-        if matches!(case, "repair" | "partial") {
-            let _granted = fs::OpenOptions::new()
-                .access_mode(WRITE_OWNER)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(&root)
-                .unwrap();
-        }
         let observed = SavedAccess::capture(&root, 0);
         let expected_owner = match case {
             "foreign" => "S-1-5-18",
@@ -247,7 +240,35 @@ fn windows_state_root_owners_and_dacl() {
         };
         crate::native::doctor::run(request).unwrap();
         assert_eq!(SavedAccess::capture(&root, 0).as_text(), before);
+        let probe = |right| {
+            fs::OpenOptions::new()
+                .access_mode(right)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&root)
+        };
+        if matches!(case, "repair" | "partial") {
+            probe(WRITE_OWNER).unwrap_or_else(|error| {
+                panic!("{case}: fixture must grant WRITE_OWNER: {error}; {before}")
+            });
+        }
+        if matches!(case, "denied" | "partial") {
+            let right = if case == "denied" {
+                WRITE_OWNER
+            } else {
+                WRITE_DAC
+            };
+            let access = probe(right);
+            assert_eq!(
+                access.as_ref().err().and_then(std::io::Error::raw_os_error),
+                Some(ERROR_ACCESS_DENIED as i32),
+                "{case}: fixture open for {right:#x} returned {access:?}; {before}"
+            );
+        }
         let result = create_directory(&root, &[]);
+        match &result {
+            Ok(session) => eprintln!("{case}: create_directory returned Ok({session:?}); {before}"),
+            Err(error) => eprintln!("{case}: create_directory returned Err({error:#}); {before}"),
+        }
         match case {
             "accepted" | "repair" | "retry" => {
                 result.unwrap();
@@ -316,28 +337,30 @@ fn windows_state_root_owners_and_dacl() {
         // CI temporary roots can have an explicit Administrators full-control ACE.
         // Reset it to inherited grants before constructing the fixture's explicit DACL.
         icacls(path, &["/reset"]);
-        icacls(path, &["/grant:r", &format!("*{user}:(OI)(CI)F")]);
+        // /grant:r replaces an explicit allow ACE with the same inheritance flags.
+        // Give setup and child grants the same scope so full control cannot survive.
+        let (scope, rights) = match case {
+            "denied" | "foreign" => ("", "(RD,REA,RA,X,RC,S)"),
+            "partial" => ("", "(RD,REA,RA,X,RC,S,WO)"),
+            _ => ("(OI)(CI)", "F"),
+        };
+        icacls(path, &["/grant:r", &format!("*{user}:{scope}F")]);
         let owner = match case {
             "foreign" => "S-1-5-18",
             "accepted" => account.owners.last().unwrap().as_str(),
             _ => "S-1-5-32-544",
         };
         icacls(path, &["/setowner", &format!("*{owner}")]);
-        let grant = match case {
-            "denied" | "foreign" => "(RD,REA,RA,X,RC,S)",
-            "partial" => "(RD,REA,RA,X,RC,S,WO)",
-            _ => "(OI)(CI)F",
-        };
         icacls(path, &["/inheritance:r"]);
         if case == "partial" {
             icacls(path, &["/grant:r", "*S-1-3-4:(RC)"]);
         }
-        icacls(path, &["/grant:r", &format!("*{user}:{grant}")]);
+        icacls(path, &["/grant:r", &format!("*{user}:{scope}{rights}")]);
         if case == "unmarked" {
             icacls(path, &["/grant", "*S-1-1-0:(R)"]);
         }
         let run = |case| {
-            Command::new(std::env::current_exe().unwrap())
+            let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "windows_state_root_owners_and_dacl",
                     "--nocapture",
@@ -347,15 +370,18 @@ fn windows_state_root_owners_and_dacl() {
                 .env("AGENT_BRIDGE_NATIVE_STATE_DIR", path)
                 .env("TABCLI_ROOT_FIXTURE", path)
                 .output()
-                .unwrap()
-        };
-        let output = run(case);
-        original.restore_dacl();
-        assert!(output.status.success(), "{case}: {output:?}");
-        if case == "partial" {
-            let retry = run("retry");
-            assert!(retry.status.success(), "retry: {retry:?}");
+                .unwrap();
             original.restore_dacl();
+            assert!(
+                output.status.success(),
+                "{case}: child exited with {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(case);
+        if case == "partial" {
+            run("retry");
         }
     }
 }
