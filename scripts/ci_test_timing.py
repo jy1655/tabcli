@@ -15,7 +15,8 @@ import sys
 import time
 
 
-COMMAND = ["cargo", "test", "--all-targets", "--all-features", "--", "--test-threads=1"]
+COMMAND = ["cargo", "test", "--all-targets", "--all-features", "--no-fail-fast", "--",
+           "--test-threads=1"]
 # An absolute directory for the tests' TEMP and TMP, used only on an NTFS volume (see
 # docs/testing.md#windows-ci-performance-observations). Not passed on to the tests.
 FIXTURE_TEMP_ENV = "CI_TEST_FIXTURE_TEMP"
