@@ -322,3 +322,42 @@ fn ordinary_self_test_with_the_allow_setting_runs_ask() {
     assert_eq!(report["outcome"], "unsupported");
     assert_eq!(report["steps"].as_array().unwrap().len(), 5);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_self_test_reports_a_non_unicode_root_without_creating_it() {
+    use std::os::unix::ffi::OsStrExt;
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"state-\xff"));
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .args(["self-test", "claude", "--terminal", "tmux"])
+            .args(args)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &root)
+            .env("HOME", parent.path())
+            .env("PATH", parent.path())
+            .output()
+            .unwrap()
+    };
+    let json = run(&["--json"]);
+    assert!(!json.status.success());
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report.get("state_root"), Some(&Value::Null));
+    let steps = report["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["name"], "admission");
+    assert_eq!(steps[0]["outcome"], "failed");
+    assert_eq!(steps[0]["reason"], "state root path is not Unicode text");
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    let human = run(&[]);
+    assert!(!human.status.success());
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "state root: not Unicode text")
+    );
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}

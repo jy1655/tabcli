@@ -835,7 +835,12 @@ fn print_report(request: &Request, report: &Report) -> Result<()> {
             ),
             report.terminal.as_deref().unwrap_or("not verified"),
             report.state_root.as_ref().map_or_else(
-                || "not created".to_owned(),
+                || if report.isolated {
+                    "not created"
+                } else {
+                    "not Unicode text"
+                }
+                .to_owned(),
                 |root| terminal_safe_text(&root.display().to_string(), false)
             ),
             report.session.as_deref().unwrap_or("none"),

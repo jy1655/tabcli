@@ -29,8 +29,7 @@ pub(super) struct StartOptions {
     pub(super) json: bool,
 }
 
-// Only `resolve` constructs one: a Resolved is the outcome of the operations below, never of
-// a caller's own assembly.
+// In production, only `resolve_at` constructs a Resolved.
 pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
@@ -193,12 +192,11 @@ impl DefaultTitle<'_> {
     }
 }
 
-// What a fresh start and a reopen resolve differently; the resolution itself is the same
-// operations (`resolve`). `ask` fills it from its request, `reopen` from its request and the
-// closed source.
+// Inputs to shared resolution (`resolve_at`). Ask supplies its request, and reopen
+// also uses the closed source.
 pub(super) struct Resolution<'a> {
     pub(super) provider: FirstPartyCli,
-    // The workspace as requested; the resolution canonicalizes it.
+    // The workspace as requested by ask or recorded in the reopen source manifest.
     pub(super) workspace: &'a Path,
     pub(super) consent_path: ConsentPath,
     pub(super) title: Option<String>,
@@ -215,7 +213,7 @@ pub(super) struct Resolution<'a> {
     // What the caller check found when the surface was chosen.
     pub(super) caller: CallerCheck,
     pub(super) context_sources: Vec<requests::ContextSource>,
-    // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
+    // Used by resolve_with (ask in production). Reopen checks its source workspace before recovery.
     pub(super) workspace_noun: &'static str,
     // How an admission refusal is reported: unchanged for `ask`, typed as reopen's
     // workspace-refused gate for a reopen.
@@ -405,7 +403,7 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
 
 // What the caller check of an automatic Herdr choice found where `choose_launch_surface` ran
 // it: the place where 0.4.49 ran it, before the workspace, the probe and, for a reopen, the
-// source. The resolution uses it once the choice is decided (`resolve_with`).
+// source. The resolution uses it once the choice is decided (`resolve_at`).
 pub(super) enum CallerCheck {
     // Nothing to prove: an explicit choice, a choice outside hc, or an automatic choice the
     // provider takes on its fallback at every version.
@@ -432,10 +430,11 @@ pub(super) enum CallerCheck {
 // the version (Claude, Agy, Pi); for `reopen`, which does not know its provider before it
 // reads its source, always, as in 0.4.49 (every provider that supports reopen runs on Herdr,
 // so no reopen that would take the fallback is refused). Where the version decides (Codex off
-// Windows), the outcome is kept for `resolve_with` only while the request has time left.
-// A provider that takes its fallback at
-// every version is not checked. `resolve` then decides with the provider, before the
-// workspace (`choose_before_probe`) and again with the probed version (`admit_choice`).
+// Windows), the outcome is kept for `resolve_at` only while the request has time left.
+// A provider that takes its fallback at every version is not checked. Ask runs
+// `choose_before_probe` before workspace resolution. Reopen checks the source workspace's
+// spelling before child recovery and reports other workspace errors after `choose_before_probe`.
+// Both use `admit_choice` in `resolve_at` with the probed version.
 pub(super) fn choose_launch_surface(
     requested: Option<terminal::TerminalKind>,
     provider: Option<FirstPartyCli>,

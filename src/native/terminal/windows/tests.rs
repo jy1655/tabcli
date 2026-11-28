@@ -21,7 +21,7 @@ use std::os::windows::{
     io::{AsRawHandle, FromRawHandle, OwnedHandle},
     process::CommandExt,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{TRUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Globalization::{CSTR_LESS_THAN, CompareStringOrdinal};
@@ -731,11 +731,11 @@ fn windows_console_launch_uses_non_verbatim_powershell_paths() {
     // The normalized value must reach both the tab request and console-window
     // constructor, not just argv[0]: CreateProcessW has a separate application name.
     let source = include_str!("mod.rs").replace("\r\n", "\n");
-    assert!(source.contains(
-        "let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(\n        &powershell_executable()?,\n    ));"
-    ));
+    assert!(source.contains("let powershell = powershell_executable()?;"));
     assert!(source.contains("tab::offer(\n        &powershell,\n        &command_line,"));
-    assert!(source.contains("ConsoleWindow::create(&powershell, &command_line, deadline)"));
+    assert!(
+        source.contains("ConsoleWindow::create(Path::new(&powershell), &command_line, deadline)")
+    );
     for (path, expected) in [
         (
             r"\\?\C:\Program Files (x86)\PowerShell\7\pwsh.exe",
@@ -746,10 +746,12 @@ fn windows_console_launch_uses_non_verbatim_powershell_paths() {
             r"\\server\share\PowerShell\7\pwsh.exe",
         ),
     ] {
-        let application = PathBuf::from(provider_process::windows_command_path(Path::new(path)));
-        assert_eq!(application, Path::new(expected));
+        let application =
+            provider_process::windows_command_path(Path::new(path), "PowerShell 7 executable")
+                .unwrap();
+        assert_eq!(application, expected);
         let command_line =
-            terminal::windows_console_launch_command_line(Path::new(path), "exit 0").unwrap();
+            terminal::windows_console_launch_command_line(&application, "exit 0").unwrap();
         assert!(command_line.starts_with(&format!("\"{expected}\" ")));
         assert!(!command_line.contains(r"\\?\"));
     }

@@ -102,7 +102,7 @@ pub(in crate::native) fn bridge_shell_command(
     #[cfg(unix)]
     let quote = |value: &str| shell_quote(value.as_ref());
     #[cfg(windows)]
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let quote = terminal::powershell_quote;
     let quote_path = |path: &Path, field: &str| -> Result<String> {
         let text = launch_path_text(path, field)?;
         validate_shell_command_component(text.as_ref(), field)?;

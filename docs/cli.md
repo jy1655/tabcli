@@ -1584,8 +1584,8 @@ settings; use ordinary self-test with the allow setting to permit this workspace
 refused test runs no `ask`, discovery, or cleanup. Its report has `outcome: "failed"`, null
 `session` and `session_state`, one step `{"name": "admission", "outcome": "failed", ...}` with the
 reason, and empty `cleanup_sessions`. The report gives the ordinary root when it is Unicode text.
-For a refused isolated test or an unrepresentable ordinary root, `state_root` is null and human
-output prints `state root: not created`.
+Human output prints `state root: not created` for a refused isolated test and
+`state root: not Unicode text` for an ordinary root that cannot be represented.
 
 Human output reports the mode, CLI, terminal, state root, session, each step, cleanup, and overall
 outcome. In JSON, read each failed step’s `reason` and `request_address`. See the [JSON field
@@ -2129,9 +2129,9 @@ and `cleanup_sessions`. Steps contain `name`, `outcome`, `elapsed_ms`, `request_
 `reason`. An Agy result timeout can append the same request's tool-confirmation observation
 from `doctor` to the existing step `reason`; a Pi result timeout can append the session's
 provider credential readiness. No field is added. A step's outcome uses a command's
-[`failure_kind`](#failure_kind) hint as described in [self-test](#self-test). A refusal report with a null
-`state_root` has one step, `admission`. The root is null if the test was isolated or its ordinary
-root could not be represented as Unicode text.
+[`failure_kind`](#failure_kind) hint as described in [self-test](#self-test). `state_root` is null
+only in an admission refusal for an isolated test or an ordinary root that is not Unicode text.
+That report has one step, `admission`.
 
 ### settings
 

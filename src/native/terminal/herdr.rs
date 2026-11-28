@@ -1066,8 +1066,8 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
 fn hc_command(endpoint: &str, command: &str, address: &str, powershell: bool) -> String {
     if powershell {
         format!(
-            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = '{}'; try {{ hc {command} {address} }} finally {{ $env:HC_SOCKET = $prior }} }}",
-            endpoint.replace('\'', "''")
+            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = {}; try {{ hc {command} {address} }} finally {{ $env:HC_SOCKET = $prior }} }}",
+            super::powershell_quote(endpoint)
         )
     } else {
         format!(

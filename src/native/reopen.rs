@@ -312,10 +312,16 @@ impl ResolvedReopen {
         session_start::check_launch_environment(&root)?;
         let source_directory = Reader::session_directory_in(&root, &request.id)?;
         session_start::deadline::before("inspecting the reopen source")?;
-        let manifest = Reader::open_unchecked(&source_directory).manifest()?;
-        let workspace = session_start::LaunchWorkspace::read(&manifest.workspace)?
-            .directory("source workspace");
+        let source_paths = match Reader::open_unchecked(&source_directory).manifest() {
+            Ok(manifest) => {
+                let workspace = session_start::LaunchWorkspace::read(&manifest.workspace)?
+                    .directory("source workspace");
+                Ok((manifest, workspace))
+            }
+            Err(error) => Err(error),
+        };
         let _ = retry_interrupted_launch_fence(&source_directory);
+        let (manifest, workspace) = source_paths?;
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.

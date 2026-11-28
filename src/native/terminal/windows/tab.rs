@@ -350,7 +350,7 @@ impl TabSurface {
 /// Every error is a reason why no tab can be had; the request is withdrawn in that case
 /// and the caller creates a console window instead.
 pub(super) fn offer(
-    powershell: &Path,
+    powershell: &str,
     command_line: &str,
     directory: &Path,
     window: WindowsTabWindow,
@@ -370,10 +370,7 @@ pub(super) fn offer(
     let request = HostRequest {
         schema: 1,
         attempt: new_attempt(),
-        executable: powershell
-            .to_str()
-            .context("PowerShell 7 executable path is not UTF-8")?
-            .to_owned(),
+        executable: powershell.to_owned(),
         command_line: command_line.to_owned(),
         deadline_unix_ms: crate::native::session::primitives::unix_ms() + budget.as_millis(),
         accepted: false,

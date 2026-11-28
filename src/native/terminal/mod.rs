@@ -949,6 +949,19 @@ pub(in crate::native) use windows_incarnation::WindowsIncarnation;
 #[cfg(windows)]
 pub(super) use windows::query_process_identity as windows_process_identity;
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(in crate::native) fn powershell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if matches!(character, '\'' | '\u{2018}'..='\u{201b}') {
+            quoted.push(character);
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
+}
+
 #[cfg(unix)]
 pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
     let value = value.to_string_lossy();

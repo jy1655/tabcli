@@ -15,7 +15,6 @@ pub(in crate::native::terminal) fn start_root(command: &str, kind: TerminalKind)
     (|| {
         let arguments = super::console_root_arguments(command)?;
         let powershell = super::powershell_executable()?;
-        let powershell = crate::native::provider_process::windows_command_path(&powershell);
         ignore_interrupts()?;
         crate::native::process_env::helper_command(&powershell)
             .raw_arg(arguments)
