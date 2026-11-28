@@ -220,24 +220,26 @@ verify a TAB entry there and leaves the target permissions alone.
 On macOS the root must report no extended ACL, including an inherited or zero-entry ACL.
 For a recognized TAB directory with an extended ACL, TAB identifies the entry when readable.
 Clear a user immutable flag with `chflags nouchg` before retrying a permission repair. An
-administrator must clear a system immutable flag. If an ACL prevents access to a recognized
-TAB directory, the remedy is `chmod -N` on that directory. If macOS privacy controls prevent
-access, check the terminal's privacy settings.
+administrator must clear a system immutable flag. When TAB reads an extended ACL on a
+recognized root with no immutable flag or failed permission change, it names `chmod -N`
+for that directory. If macOS denies the directory open or
+ACL read with an unexplained permission error (`EPERM`), TAB advises checking the terminal's
+privacy access even when it cannot establish which entries the directory holds.
 
 On Windows the root must have a protected DACL whose only entry grants the token user
 inheritable full control. Its owner must match the token user or default owner.
 A later run may take ownership from Administrators when that SID is outside its accepted
 owners and its existing rights permit the change. For another foreign owner on a recognized
-TAB root or a denied owner change, take ownership of the intended TAB directory before
-retrying.
+TAB root or a denied open for an owner change, take ownership of the intended TAB directory
+before retrying.
 
 TAB limits macOS ACL removal and Windows ownership changes to roots it just created or
 directories already containing a durability receipt, settings file, workspace-consent directory,
 or Session directory. When an existing directory lacks such an entry and would need either
 repair, set `AGENT_BRIDGE_NATIVE_STATE_DIR` to a directory meant for TAB. When reporting a
 privacy failure, doctor, Session creators and standalone writers give the same advice if
-they cannot determine whether the directory holds a TAB entry. The Windows DACL can still
-be repaired when the owner is refused.
+they cannot determine whether the directory holds a TAB entry, except for the macOS privacy
+access advice above. The Windows DACL can still be repaired when the owner is refused.
 These checks cover the root itself at preparation time. Ancestor security and descendant ACLs
 are outside the check. Administrators and the operating system can still access the data.
 

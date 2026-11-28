@@ -1,4 +1,4 @@
-use super::{Action, Entries, Flags, Observation, tab_entry};
+use super::{Action, Cause, Entries, Flags, Observation, tab_entry};
 use anyhow::{Context, Result};
 use std::{
     ffi::CString,
@@ -44,24 +44,22 @@ fn open(path: &Path, no_follow: bool) -> io::Result<File> {
 fn open_root(path: &Path, action: Action) -> Result<(File, bool)> {
     match open(path, false) {
         Ok(file) => Ok((file, false)),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+        Err(error)
+            if matches!(
+                Cause::of(&error),
+                Cause::AccessDenied | Cause::PermissionDenied | Cause::NotPermitted
+            ) =>
+        {
             open_denied_root(path, action, error)
         }
-        Err(error) => {
-            let observation = if error.kind() == io::ErrorKind::NotADirectory {
-                Observation::NotDirectory
-            } else {
-                Observation::Open
-            };
-            Err(observation.render(path, &action.unopened(), Flags::None, Some(error.into())))
-        }
+        Err(error) => Err(action.open_failure(path, error)),
     }
 }
 
 fn open_denied_root(path: &Path, action: Action, error: io::Error) -> Result<(File, bool)> {
     let entries = action.unopened();
     #[cfg(target_os = "macos")]
-    if error.raw_os_error() == Some(libc::EPERM) {
+    if Cause::of(&error) == Cause::NotPermitted {
         return Err(Observation::Open.render(path, &entries, Flags::None, Some(error.into())));
     }
     // A trailing slash (or "/.") makes lstat follow a final link.
@@ -186,7 +184,7 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
 
     match &issue {
         #[cfg(target_os = "macos")]
-        Observation::AclRead(error) if error.raw_os_error() != Some(libc::EACCES) => {
+        Observation::AclRead(error) if Cause::of(error) != Cause::AccessDenied => {
             return Err(issue.render(path, &entries(), observed_flags, None));
         }
         #[cfg(target_os = "macos")]
@@ -282,13 +280,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_open_eperm_preserves_mode_and_reports_privacy_access() {
+    fn macos_open_eperm_reports_terminal_privacy_access_when_entries_are_unknown() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
         for action in [Action::Inspect, Action::Prepare { created: false }] {
             let denied = io::Error::from_raw_os_error(libc::EPERM);
             let expected = format!(
-                "open state directory; macOS privacy controls may prevent access; cannot determine whether the directory holds a TAB entry; set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB: {denied}"
+                "open state directory; macOS privacy controls may prevent access; cannot determine whether the directory holds a TAB entry; check the terminal's macOS privacy access to this directory: {denied}"
             );
             let error = open_denied_root(root.path(), action, denied).unwrap_err();
             assert_eq!(format!("{error:#}"), expected);

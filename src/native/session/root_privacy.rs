@@ -19,10 +19,29 @@ pub(in crate::native) enum Action {
 
 mod diagnosis;
 pub(super) use diagnosis::Observation;
+use diagnosis::{Cause, Entries, Flags};
 pub(in crate::native) use diagnosis::{Diagnosis, RootStatus};
-use diagnosis::{Entries, Flags};
 
 impl Action {
+    fn open_failure(self, path: &Path, error: std::io::Error) -> anyhow::Error {
+        // An open follows the final link. Only a separate no-follow inspection
+        // can distinguish an absent name from a link whose target is missing.
+        let cause = Cause::of(&error);
+        if self == Self::Inspect
+            && cause == Cause::Missing
+            && std::fs::symlink_metadata(path.components().as_path())
+                .is_err_and(|e| Cause::of(&e) == Cause::Missing)
+        {
+            return Observation::Absent.render(path, &self.unopened(), Flags::None, None);
+        }
+        let issue = if cause == Cause::NotDirectory {
+            Observation::NotDirectory
+        } else {
+            Observation::Open
+        };
+        issue.render(path, &self.unopened(), Flags::None, Some(error.into()))
+    }
+
     fn entries(self, list: impl FnOnce() -> Result<bool>) -> Entries {
         match self {
             Self::Prepare { created: true } => Entries::Known,

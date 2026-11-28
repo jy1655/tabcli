@@ -361,7 +361,7 @@ fn set(root: &File, descriptor: &Descriptor, owner: bool) -> Result<()> {
     };
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status as i32))
-            .with_context(|| format!("SetSecurityInfo: {operation}"));
+            .context(super::diagnosis::SecurityWrite(operation));
     }
     Ok(())
 }
@@ -372,9 +372,7 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
         .share_mode(SHARING)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .map_err(|error| {
-            Observation::Open.render(path, &action.unopened(), Flags::None, Some(error.into()))
-        })?;
+        .map_err(|error| action.open_failure(path, error))?;
     if !root
         .metadata()
         .context("read opened directory attributes")?

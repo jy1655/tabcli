@@ -1,7 +1,92 @@
 //! Evidence from the opened root and its single user-facing remedy.
 use std::{fmt, io, path::Path};
 
+#[cfg(target_os = "macos")]
+const PRIVACY_ACCESS: &str = "check the terminal's macOS privacy access to this directory";
 const SELECT_ROOT: &str = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(super) enum Cause {
+    Missing,
+    AccessDenied,
+    PermissionDenied,
+    #[cfg(unix)]
+    NotPermitted,
+    NotDirectory,
+    ReadOnly,
+    Other,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ErrorCode {
+    Native(i32),
+    Kind(io::ErrorKind),
+}
+
+// The consumer matrix takes its inputs from these same discriminators. Keep native
+// codes before kind fallbacks: on Darwin EPERM and EACCES have the same ErrorKind.
+const CAUSES: &[(ErrorCode, Cause)] = {
+    use ErrorCode::{Kind, Native};
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        ERROR_WRITE_PROTECT,
+    };
+    &[
+        #[cfg(unix)]
+        (Native(libc::ENOENT), Cause::Missing),
+        #[cfg(unix)]
+        (Native(libc::EACCES), Cause::AccessDenied),
+        #[cfg(unix)]
+        (Native(libc::EPERM), Cause::NotPermitted),
+        #[cfg(unix)]
+        (Native(libc::ENOTDIR), Cause::NotDirectory),
+        #[cfg(unix)]
+        (Native(libc::EROFS), Cause::ReadOnly),
+        #[cfg(windows)]
+        (Native(ERROR_FILE_NOT_FOUND as i32), Cause::Missing),
+        #[cfg(windows)]
+        (Native(ERROR_PATH_NOT_FOUND as i32), Cause::Missing),
+        #[cfg(windows)]
+        (Native(ERROR_ACCESS_DENIED as i32), Cause::AccessDenied),
+        #[cfg(windows)]
+        (Native(ERROR_DIRECTORY as i32), Cause::NotDirectory),
+        #[cfg(windows)]
+        (Native(ERROR_WRITE_PROTECT as i32), Cause::ReadOnly),
+        (Kind(io::ErrorKind::NotFound), Cause::Missing),
+        (
+            Kind(io::ErrorKind::PermissionDenied),
+            Cause::PermissionDenied,
+        ),
+        (Kind(io::ErrorKind::NotADirectory), Cause::NotDirectory),
+    ]
+};
+
+impl Cause {
+    pub(super) fn of(error: &io::Error) -> Self {
+        CAUSES
+            .iter()
+            .find_map(|&(code, cause)| {
+                let matches = match code {
+                    ErrorCode::Native(n) => error.raw_os_error() == Some(n),
+                    ErrorCode::Kind(kind) => error.kind() == kind,
+                };
+                matches.then_some(cause)
+            })
+            .unwrap_or(Self::Other)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(super) struct SecurityWrite(pub(super) &'static str);
+
+#[cfg(windows)]
+impl fmt::Display for SecurityWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SetSecurityInfo: {}", self.0)
+    }
+}
 
 pub(super) enum Entries {
     Known,
@@ -10,7 +95,7 @@ pub(super) enum Entries {
 }
 
 impl Entries {
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) fn required_for_repair(&self) -> &Self {
         match self {
             Self::Empty { .. } => &Self::Empty {
@@ -32,6 +117,7 @@ pub(super) enum Flags {
 
 #[derive(Debug)]
 pub(in crate::native::session) enum Observation {
+    Absent,
     Open,
     NotDirectory,
     InspectPath,
@@ -103,6 +189,7 @@ impl std::error::Error for Diagnosis {}
 impl Observation {
     fn describe(&self, path: &Path) -> String {
         match self {
+            Self::Absent => "state directory does not exist".into(),
             #[cfg(windows)]
             Self::Open => {
                 "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES".into()
@@ -161,8 +248,9 @@ impl Observation {
             Self::AclRead(e) => Some(e),
             _ => None,
         });
+        let cause = os.map(Cause::of);
         let status = match self {
-            Self::Open if os.is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => Absent,
+            Self::Absent => Absent,
             Self::NotDirectory | Self::Owner { .. } => NotPrivate,
             #[cfg(unix)]
             Self::Mode(_) => NotPrivate,
@@ -173,11 +261,11 @@ impl Observation {
             _ => Unreadable,
         };
         let mut detail = self.describe(path);
-        let code = os.and_then(io::Error::raw_os_error);
-        #[cfg(unix)]
-        let read_only = code == Some(libc::EROFS);
-        #[cfg(windows)]
-        let read_only = code == Some(windows_sys::Win32::Foundation::ERROR_WRITE_PROTECT as i32);
+        let no_directory = matches!(
+            self,
+            Self::Absent | Self::NotDirectory | Self::CreatePath | Self::Resolve
+        ) || (matches!(self, Self::Open) && cause == Some(Cause::Missing));
+        let read_only = cause == Some(Cause::ReadOnly);
         #[cfg(unix)]
         let quoted = || format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
         #[cfg(not(target_os = "macos"))]
@@ -195,25 +283,36 @@ impl Observation {
         match flags {
             Flags::UserImmutable => detail.push_str("; user immutable flag is set"),
             Flags::SystemImmutable => detail.push_str("; system immutable flag is set"),
-            Flags::None if code == Some(libc::EPERM) => {
+            Flags::None if !no_directory && cause == Some(Cause::NotPermitted) => {
                 detail.push_str("; macOS privacy controls may prevent access")
             }
             Flags::None => {}
         }
 
+        if !no_directory {
+            match entries {
+                Entries::Known => {}
+                Entries::Empty { .. } => detail.push_str("; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory)"),
+                Entries::Undetermined(reason) => {
+                    detail.push_str("; cannot determine whether the directory holds a TAB entry");
+                    if let Some(reason) = reason {
+                        detail.push_str(&format!(" ({reason:#})"));
+                    }
+                }
+            }
+        }
         let remedy = match entries {
             _ if status == Absent => "TAB creates it at the first session.".into(),
-            Entries::Empty { .. } => {
-                detail.push_str("; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory)");
-                SELECT_ROOT.into()
+            _ if no_directory => SELECT_ROOT.into(),
+            #[cfg(target_os = "macos")]
+            _ if (matches!(self, Self::Open)
+                || (matches!(self, Self::AclRead(_)) && failure.is_none()))
+                && flags == Flags::None
+                && cause == Some(Cause::NotPermitted) =>
+            {
+                PRIVACY_ACCESS.into()
             }
-            Entries::Undetermined(reason) => {
-                detail.push_str("; cannot determine whether the directory holds a TAB entry");
-                if let Some(reason) = reason {
-                    detail.push_str(&format!(" ({reason:#})"));
-                }
-                SELECT_ROOT.into()
-            }
+            Entries::Empty { .. } | Entries::Undetermined(_) => SELECT_ROOT.into(),
             Entries::Known if read_only => "select a writable directory meant for TAB".into(),
             #[cfg(target_os = "macos")]
             Entries::Known if flags == Flags::SystemImmutable => {
@@ -225,11 +324,22 @@ impl Observation {
                 quoted()
             ),
             #[cfg(target_os = "macos")]
-            Entries::Known if code == Some(libc::EPERM) => {
-                "check the terminal's macOS privacy access to this directory".into()
-            }
+            Entries::Known if cause == Some(Cause::NotPermitted) => PRIVACY_ACCESS.into(),
             // Unclassified I/O failures give no evidence that editing permissions helps.
-            Entries::Known if os.is_some_and(|e| e.kind() != io::ErrorKind::PermissionDenied) => {
+            Entries::Known
+                if matches!(
+                    cause,
+                    Some(Cause::Other | Cause::Missing | Cause::NotDirectory)
+                ) =>
+            {
+                String::new()
+            }
+            #[cfg(windows)]
+            Entries::Known
+                if failure
+                    .as_ref()
+                    .is_some_and(|error| error.is::<SecurityWrite>()) =>
+            {
                 String::new()
             }
             Entries::Known => match self {
@@ -245,9 +355,9 @@ impl Observation {
                     format!("restore owner permissions with chmod 700 {}", quoted())
                 }
                 #[cfg(target_os = "macos")]
-                Self::Acl(_) => format!("run chmod -N {} and retry", quoted()),
+                Self::Acl(_) if failure.is_none() => format!("run chmod -N {} and retry", quoted()),
                 #[cfg(target_os = "macos")]
-                Self::AclRead(_) if code == Some(libc::EACCES) => {
+                Self::AclRead(_) if cause == Some(Cause::AccessDenied) => {
                     "check read access to the extended ACL".into()
                 }
                 #[cfg(windows)]

@@ -133,6 +133,74 @@ fn doctor_reports_a_missing_root_without_creating_it() {
 }
 
 #[test]
+fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path();
+    let target = parent.join("target");
+    let root = parent.join("root");
+    std::fs::create_dir(&target).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &root).unwrap();
+    #[cfg(windows)]
+    {
+        let output = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&root)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let destination = std::fs::read_link(&root).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    #[cfg(unix)]
+    let error = std::fs::File::open(&root).unwrap_err();
+    #[cfg(windows)]
+    let error = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL,
+        };
+        std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .unwrap_err()
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    let operation = if cfg!(windows) {
+        "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES"
+    } else {
+        "open state directory"
+    };
+    let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+    let detail = format!(
+        "state root {}: {operation}; {remedy}: {error}",
+        root.display()
+    );
+    let warning = format!("warning: {detail}");
+    for args in [
+        &["settings", "macos-open-mode", "tab-first"][..],
+        &["consent", "revoke", parent.to_str().unwrap(), "--json"],
+    ] {
+        let output = run(&root, args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.lines().next(),
+            Some(warning.as_str()),
+            "{args:?}: {stderr}"
+        );
+    }
+    let doctor = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+    assert_eq!(doctor["reason_code"], "state_root_unreadable");
+    assert_eq!(doctor["next_action"], remedy);
+    assert_eq!(doctor["detail"], detail);
+    assert_eq!(std::fs::read_link(&root).unwrap(), destination);
+    assert!(!target.exists());
+}
+
+#[test]
 fn queries_preserve_root_permissions_and_session_records() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
