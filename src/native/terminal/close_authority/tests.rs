@@ -1285,8 +1285,7 @@ fn check_unspawned_surface(
             chain.push(
                 "could not prove absence of the recorded terminal surface; no close was sent",
             );
-        }
-        if kind != AppleTerminal && !attests {
+        } else if kind != AppleTerminal {
             chain.push(
                 "could not prove absence of the ownerless terminal surface; no close was sent",
             );

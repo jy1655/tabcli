@@ -770,8 +770,9 @@ handles through the same reader and retains damaged evidence. On macOS and Linux
 preserves an intent or a Surface that can outlive its owner for explicit Close. For a
 core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-record).
 Windows Repair retains an active managed console for explicit Close and settles an exited
-or failed session from its Records. For a live owner and an absent Herdr terminal, platform
-teardown rules are tracked in [#421](https://github.com/jy1655/tabcli/issues/421).
+or failed session from its Records. When the Herdr core proves the terminal absent, explicit Close
+on macOS and Linux ends the live attested owner's foreground process group and settles the session.
+Windows refuses this Close because it has no foreground process group ([#421](https://github.com/jy1655/tabcli/issues/421)).
 An owned Windows console close can settle after root exit while the wrapper survives
 ([#460](https://github.com/jy1655/tabcli/issues/460)).
 

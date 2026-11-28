@@ -777,12 +777,26 @@ fn absent_console_close_settles_only_after_cleaning_the_bound_tab_host() {
 fn installed_console_owner_classifies_live_reused_ended_and_uninspectable_processes() {
     use crate::native::{
         process_identity::{Attested, Gone, ProcessObservation},
-        session::test_support::lifecycle::deny_process_synchronize,
+        session::test_support::lifecycle::{DisabledDebugPrivilege, deny_process_synchronize},
         terminal::{
             close_authority::{CloseObservation, Production},
             ownership::NativeSessionOwner,
         },
     };
+    const CHILD: &str = "TABCLI_CONSOLE_OWNER_CLASSIFIER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let running = std::thread::current();
+        let name = running.name().expect("libtest names the running test");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        crate::native::tests::assert_child_ran_this_test(&output);
+        return;
+    }
+    let _privilege = DisabledDebugPrivilege::in_isolated_process(CHILD);
     let directory = tempfile::tempdir().unwrap();
     let session = super::TerminalSession::new(super::TerminalKind::WindowsConsole, "42".into());
     let observation = Production::new(
@@ -871,7 +885,7 @@ fn explicit_close_of_a_retained_console_preserves_the_gone_owner_diagnosis() {
         },
     };
     let id = "session-retained";
-    for reused in [true, false] {
+    for (reused, bound) in [(true, true), (false, true), (false, false)] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(id);
         std::fs::create_dir(&path).unwrap();
@@ -905,22 +919,25 @@ fn explicit_close_of_a_retained_console_preserves_the_gone_owner_diagnosis() {
         assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), before);
         assert!(host.try_wait().unwrap().is_none());
 
-        let reason = if reused {
+        if reused {
             let mut old = identity;
             old.creation_time += 1;
             owner.windows_process_identity = Some(old);
-            "existing session diagnosis".to_owned()
         } else {
             owner.pid = root.id();
             owner.windows_process_identity = store.terminal().unwrap().windows_identity().cloned();
-            format!("native session process {} is no longer running", owner.pid)
-        };
+        }
+        owner.managed_session_id = bound.then(|| id.to_owned());
         store.write_owner(&owner).unwrap();
-        if reused {
+        let reason = if reused || !bound {
+            let reason = "existing session diagnosis".to_owned();
             let mut status = store.status().unwrap();
             status.error = Some(reason.clone());
             store.write_status(&status).unwrap();
-        }
+            reason
+        } else {
+            format!("native session process {} is no longer running", owner.pid)
+        };
         let mut calls = 0;
         let budget = deadline();
         let result = close::close_for_cause(

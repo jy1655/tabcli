@@ -12,12 +12,125 @@ use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::{NativeCommand, parse_args, query, terminal};
 use agent_bridge::FirstPartyCli;
 use std::fs;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
+pub(in crate::native) struct DisabledDebugPrivilege {
+    token: OwnedHandle,
+    previous: windows_sys::Win32::Security::TOKEN_PRIVILEGES,
+}
+
+#[cfg(windows)]
+impl DisabledDebugPrivilege {
+    pub(in crate::native) fn in_isolated_process(child_marker: &str) -> Self {
+        use windows_sys::Win32::{
+            Foundation::{ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
+            Security::{
+                AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+
+        assert_eq!(
+            std::env::var_os(child_marker).as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    &mut raw,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut disabled = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            unsafe {
+                LookupPrivilegeValueW(
+                    std::ptr::null(),
+                    SE_DEBUG_NAME,
+                    &mut disabled.Privileges[0].Luid,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut length = 0;
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw_handle(),
+                0,
+                &disabled,
+                std::mem::size_of_val(&previous) as u32,
+                &mut previous,
+                &mut length,
+            )
+        };
+        let error = unsafe { GetLastError() };
+        assert_ne!(
+            adjusted,
+            0,
+            "{}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+        assert!(
+            matches!(error, ERROR_SUCCESS | ERROR_NOT_ALL_ASSIGNED),
+            "token adjustment: {error}"
+        );
+        println!(
+            "isolated SeDebugPrivilege: absent={}, disabled_previous_enabled={}",
+            error == ERROR_NOT_ALL_ASSIGNED,
+            previous.PrivilegeCount == 1
+                && previous.Privileges[0].Attributes & SE_PRIVILEGE_ENABLED != 0
+        );
+        Self { token, previous }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DisabledDebugPrivilege {
+    fn drop(&mut self) {
+        if self.previous.PrivilegeCount == 0 {
+            return;
+        }
+        let restored = unsafe {
+            windows_sys::Win32::Security::AdjustTokenPrivileges(
+                self.token.as_raw_handle(),
+                0,
+                &self.previous,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert_ne!(
+            restored,
+            0,
+            "{}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+        assert_eq!(error, windows_sys::Win32::Foundation::ERROR_SUCCESS);
+    }
+}
+
+#[cfg(windows)]
 pub(in crate::native) fn deny_process_synchronize(child: &std::process::Child) -> Vec<u8> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,

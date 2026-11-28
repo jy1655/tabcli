@@ -696,7 +696,8 @@ pub(in crate::native) fn decide(
                     session.verify_managed_session(expected_session_id)?;
                     if surface_present().context(ABSENCE_CONTEXT)? {
                         bail!(
-                            "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}"
+                            "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}. End the console, then run `tabcli close-session {expected_session_id} --explicit` again once process {} has ended.",
+                            owner.pid
                         );
                     }
                     bail!("{reason}");
@@ -726,7 +727,7 @@ pub(in crate::native) fn decide(
         if !terminal::facts(session.kind).failed_start_identity {
             if observation
                 .evidence()
-                .surface_absent(None, Box::new(surface_present))?
+                .startup_surface_absent(Box::new(surface_present))?
             {
                 return Ok(TerminalCloseAuthority::Absent);
             }
@@ -836,14 +837,12 @@ pub(in crate::native) fn close_windows_owned_surface_with(
             .adapter(session.kind)?
             .end_recorded_tab_host(directory, deadline)?;
         close_remaining(deadline)?;
-    }
-    Ok(match gone_owner {
-        Some(pid) => terminal::CloseResult::keeping_diagnosis(
+        return Ok(terminal::CloseResult::keeping_diagnosis(
             terminal::CloseOutcome::Missing,
-            Some(crate::native::session::close::gone_owner_reason(pid)),
-        ),
-        None => terminal::CloseOutcome::Missing.into(),
-    })
+            gone_owner.map(crate::native::session::close::gone_owner_reason),
+        ));
+    }
+    Ok(terminal::CloseOutcome::Missing.into())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1341,8 +1340,12 @@ mod projected_authority_tests {
                                 "{label}"
                             );
                             assert_eq!(
-                                error.root_cause().to_string(),
-                                "terminal inspection denied",
+                                error
+                                    .chain()
+                                    .skip(1)
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>(),
+                                ["terminal inspection denied"],
                                 "{label}"
                             );
                         }
@@ -1365,7 +1368,7 @@ mod projected_authority_tests {
                             };
                             let expected = if present {
                                 format!(
-                                    "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}"
+                                    "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}. End the console, then run `tabcli close-session session-test --explicit` again once process 4242 has ended."
                                 )
                             } else {
                                 reason.to_owned()

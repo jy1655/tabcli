@@ -36,6 +36,12 @@ pub(in crate::native) trait CloseEvidence {
         owner: Option<&NativeSessionOwner>,
         surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
     ) -> Result<bool>;
+    fn startup_surface_absent(
+        &self,
+        surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
+    ) -> Result<bool> {
+        self.surface_absent(None, surface_present)
+    }
     fn incarnation_ended(&self, owner: &NativeSessionOwner) -> Result<bool>;
     fn resumable_authority(
         &self,
@@ -54,7 +60,7 @@ pub(in crate::native) trait CloseEvidence {
 // recorded close intent resumes as surface-only authority without rereading the owner
 // or the presence, and no incarnation is derived. Every kind but Terminal.app selects
 // it; the declared variations are the context that Warp and WezTerm add when the
-// owner record is absent and the surface is not proven absent.
+// startup has no owner record and its presence query fails.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PresenceOnly {
     ownerless_context: Option<&'static str>,
@@ -76,14 +82,21 @@ static PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT: PresenceOnly = PresenceOnly {
 impl CloseEvidence for PresenceOnly {
     fn surface_absent(
         &self,
-        owner: Option<&NativeSessionOwner>,
+        _owner: Option<&NativeSessionOwner>,
+        surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
+    ) -> Result<bool> {
+        surface_present().map(|present| !present)
+    }
+
+    fn startup_surface_absent(
+        &self,
         surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
     ) -> Result<bool> {
         use anyhow::Context as _;
-        let absent = surface_present().map(|present| !present);
+        let absent = self.surface_absent(None, surface_present);
         match self.ownerless_context {
-            Some(context) if owner.is_none() => absent.context(context),
-            _ => absent,
+            Some(context) => absent.context(context),
+            None => absent,
         }
     }
 
@@ -188,9 +201,9 @@ mod tests {
             (TerminalKind::WezTerm, true),
         ] {
             let evidence = for_kind(kind);
-            let chain = |owner: Option<&NativeSessionOwner>| {
-                evidence
-                    .surface_absent(owner, Box::new(|| Err(anyhow::anyhow!("presence cause"))))
+            let failure = || Err(anyhow::anyhow!("presence cause"));
+            let chain = |result: Result<bool>| {
+                result
                     .unwrap_err()
                     .chain()
                     .map(ToString::to_string)
@@ -204,8 +217,18 @@ mod tests {
             } else {
                 &["presence cause"]
             };
-            assert_eq!(chain(None), ownerless, "{kind:?}");
-            assert_eq!(chain(Some(&owner)), ["presence cause"], "{kind:?}");
+            assert_eq!(
+                chain(evidence.startup_surface_absent(Box::new(failure))),
+                ownerless,
+                "{kind:?}"
+            );
+            for owner in [None, Some(&owner)] {
+                assert_eq!(
+                    chain(evidence.surface_absent(owner, Box::new(failure))),
+                    ["presence cause"],
+                    "{kind:?}"
+                );
+            }
             assert!(
                 evidence
                     .surface_absent(None, Box::new(|| Ok(false)))

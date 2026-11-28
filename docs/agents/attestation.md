@@ -24,8 +24,10 @@
   after wrapper PID reuse.
 - Without a verified owner, a retained Windows console requires proof of root absence before tab-host cleanup and settlement.
   A bound owner whose process may still be live and whose ownership cannot be verified prevents both.
-- Close of a live owner's absent Herdr terminal follows the platform rules tracked in
-  [#421](https://github.com/jy1655/tabcli/issues/421). An owned Windows console close can
+- When the Herdr core proves the terminal absent, explicit close on macOS and Linux ends the
+  live attested owner's foreground process group and settles the session. Windows refuses the
+  close because it has no foreground process group ([#421](https://github.com/jy1655/tabcli/issues/421)).
+- An owned Windows console close can
   settle on root exit while the verified wrapper survives
   ([#460](https://github.com/jy1655/tabcli/issues/460)).
 - While a launch is pending, the registered owner is visible to startup repair before the provider version check.

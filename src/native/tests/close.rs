@@ -350,7 +350,7 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-fn explicit_close_allows_only_bound_ownerless_launch_failures() {
+fn explicit_close_without_an_owner_grants_surface_close_only_to_a_bound_launch_failure() {
     let session = terminal::TerminalSession::new(
         if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
@@ -572,7 +572,7 @@ fn a_live_owner_keeps_unrecoverable_journal_damage_as_a_repair_error() {
 // not in `session::launch`, which must know nothing about terminal kinds.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
+fn a_failed_startup_closes_by_stable_id_or_settles_on_proven_absence() {
     // The launch fixture: a launching session whose claim the launcher retains and whose
     // launch receipt `begin` wrote, as in `session::launch`'s own tests.
     let directory = tempfile::Builder::new()
