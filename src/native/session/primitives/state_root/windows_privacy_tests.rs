@@ -1,0 +1,413 @@
+use super::*;
+use std::os::windows::{
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, FromRawHandle, OwnedHandle},
+};
+use std::process::Command;
+use windows_sys::Win32::{
+    Foundation::LocalFree,
+    Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT, SetSecurityInfo,
+    },
+    Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+};
+use windows_sys::Win32::{
+    Foundation::{ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
+    Security::*,
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
+};
+
+const CHILD: &str = "TABCLI_STATE_ROOT_TEST_CHILD";
+
+fn icacls(root: &Path, args: &[&str]) {
+    let tool = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\icacls.exe");
+    let output = Command::new(tool).arg(root).args(args).output().unwrap();
+    assert!(output.status.success(), "{args:?}: {output:?}");
+}
+
+// Keep a handle with WRITE_DAC across the denial fixtures so cleanup needs
+// neither the child's privileges nor a successfully repaired directory.
+struct SavedAccess {
+    root: fs::File,
+    descriptor: *mut std::ffi::c_void,
+    dacl: *mut ACL,
+}
+impl SavedAccess {
+    fn capture(path: &Path, rights: u32) -> Self {
+        let root = fs::OpenOptions::new()
+            .access_mode(rights | READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        let mut descriptor = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    root.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        Self {
+            root,
+            descriptor,
+            dacl,
+        }
+    }
+    fn owner(&self) -> String {
+        let mut sid = std::ptr::null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorOwner(self.descriptor, &mut sid, &mut defaulted) },
+            0
+        );
+        let mut text = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { Authorization::ConvertSidToStringSidW(sid, &mut text) },
+            0
+        );
+        let mut length = 0;
+        unsafe {
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+        }
+        let result =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).unwrap();
+        unsafe {
+            LocalFree(text.cast());
+        }
+        result
+    }
+    fn as_text(&self) -> String {
+        let mut text = std::ptr::null_mut();
+        let mut length = 0;
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    self.descriptor,
+                    SDDL_REVISION_1,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0
+        );
+        let value =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length as usize) })
+                .unwrap();
+        unsafe {
+            LocalFree(text.cast());
+        }
+        value
+    }
+    fn restore_dacl(&self) {
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    self.root.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    self.dacl,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+}
+impl Drop for SavedAccess {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.descriptor);
+        }
+    }
+}
+
+fn child_token(user_default: bool) {
+    let mut raw = std::ptr::null_mut();
+    assert_ne!(
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_PRIVILEGES,
+                &mut raw,
+            )
+        },
+        0
+    );
+    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let token = token.as_raw_handle();
+    for name in [SE_TAKE_OWNERSHIP_NAME, SE_RESTORE_NAME, SE_BACKUP_NAME] {
+        let mut privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            unsafe {
+                LookupPrivilegeValueW(std::ptr::null(), name, &mut privileges.Privileges[0].Luid)
+            },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &privileges,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            unsafe { GetLastError() },
+            ERROR_SUCCESS | ERROR_NOT_ALL_ASSIGNED
+        ));
+    }
+    if user_default {
+        // Exercise the primary token's real owner membership even on elevated CI.
+        let mut needed = 0;
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        let mut user = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        let owner = TOKEN_OWNER {
+            Owner: unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+        };
+        assert_ne!(
+            unsafe {
+                SetTokenInformation(
+                    token,
+                    TokenOwner,
+                    (&raw const owner).cast(),
+                    size_of::<TOKEN_OWNER>() as u32,
+                )
+            },
+            0
+        );
+    }
+}
+
+#[test]
+fn windows_state_root_owners_and_dacl() {
+    if let Some(case) = std::env::var_os(CHILD) {
+        let case = case.to_str().unwrap();
+        let root = PathBuf::from(std::env::var_os("TABCLI_ROOT_FIXTURE").unwrap());
+        child_token(case != "accepted");
+        let account = crate::native::consent::windows_current_account().unwrap();
+        let administrators = "S-1-5-32-544";
+        if case != "accepted" {
+            assert!(!account.owners.iter().any(|sid| sid == administrators));
+        }
+        if matches!(case, "repair" | "partial") {
+            let _granted = fs::OpenOptions::new()
+                .access_mode(WRITE_OWNER)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&root)
+                .unwrap();
+        }
+        let observed = SavedAccess::capture(&root, 0);
+        let expected_owner = match case {
+            "foreign" => "S-1-5-18",
+            "retry" => &account.owners[0],
+            "accepted" => account.owners.last().unwrap().as_str(),
+            _ => administrators,
+        };
+        assert_eq!(observed.owner(), expected_owner);
+        let before = observed.as_text();
+        let crate::native::NativeCommand::Doctor(request) =
+            crate::native::parse_args(["doctor", "--provider", "pi", "--json"]).unwrap()
+        else {
+            panic!()
+        };
+        crate::native::doctor::run(request).unwrap();
+        assert_eq!(SavedAccess::capture(&root, 0).as_text(), before);
+        let result = create_directory(&root, &[]);
+        match case {
+            "accepted" | "repair" | "retry" => {
+                result.unwrap();
+            }
+            "denied" | "partial" => {
+                let error = result.unwrap_err();
+                let expected = if case == "denied" {
+                    "NtOpenFile: reopen directory to set owner (access 0x80000)"
+                } else {
+                    "NtOpenFile: reopen directory to set DACL (access 0x60080)"
+                };
+                assert!(
+                    error.chain().any(|e| e.to_string() == expected),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(|e| e.raw_os_error()),
+                    Some(5),
+                    "{error:#}"
+                );
+            }
+            "foreign" | "unmarked" => {
+                assert!(result.is_err(), "{case} unexpectedly created a Session")
+            }
+            _ => panic!("unknown case"),
+        }
+        if case == "unmarked" {
+            assert!(unsafe { (*observed.dacl).AceCount } > 1);
+            let repaired = SavedAccess::capture(&root, 0);
+            assert_private_dacl(&repaired);
+            assert!(crate::native::session::Store::create_settings_root(&root, &[]).is_err());
+            assert!(fs::read_dir(&root).unwrap().next().is_none());
+        }
+        let actual = SavedAccess::capture(&root, 0).owner();
+        let expected = match case {
+            "repair" | "partial" | "retry" => account.owners[0].as_str(),
+            "foreign" => "S-1-5-18",
+            "accepted" => expected_owner,
+            _ => administrators,
+        };
+        assert_eq!(actual, expected);
+        return;
+    }
+    let account = crate::native::consent::windows_current_account().unwrap();
+    // Setting SYSTEM as a fixture owner needs an elevated setup process.
+    if account.elevated != Some(true) {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must provision owner fixtures"
+        );
+        eprintln!("foreign-owner fixtures require an elevated Windows account");
+        return;
+    }
+    let user = &account.owners[0];
+    for case in [
+        "accepted", "repair", "foreign", "denied", "partial", "unmarked",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        if case != "unmarked" {
+            fs::create_dir(path.join("workspace-consent")).unwrap();
+        }
+        let original = SavedAccess::capture(path, WRITE_DAC);
+        // CI temporary roots can have an explicit Administrators full-control ACE.
+        // Reset it to inherited grants before constructing the fixture's explicit DACL.
+        icacls(path, &["/reset"]);
+        icacls(path, &["/grant:r", &format!("*{user}:(OI)(CI)F")]);
+        let owner = match case {
+            "foreign" => "S-1-5-18",
+            "accepted" => account.owners.last().unwrap().as_str(),
+            _ => "S-1-5-32-544",
+        };
+        icacls(path, &["/setowner", &format!("*{owner}")]);
+        let grant = match case {
+            "denied" | "foreign" => "(RD,REA,RA,X,RC,S)",
+            "partial" => "(RD,REA,RA,X,RC,S,WO)",
+            _ => "(OI)(CI)F",
+        };
+        icacls(path, &["/inheritance:r"]);
+        if case == "partial" {
+            icacls(path, &["/grant:r", "*S-1-3-4:(RC)"]);
+        }
+        icacls(path, &["/grant:r", &format!("*{user}:{grant}")]);
+        if case == "unmarked" {
+            icacls(path, &["/grant", "*S-1-1-0:(R)"]);
+        }
+        let run = |case| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "windows_state_root_owners_and_dacl",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, case)
+                .env("AGENT_BRIDGE_NATIVE_STATE_DIR", path)
+                .env("TABCLI_ROOT_FIXTURE", path)
+                .output()
+                .unwrap()
+        };
+        let output = run(case);
+        original.restore_dacl();
+        assert!(output.status.success(), "{case}: {output:?}");
+        if case == "partial" {
+            let retry = run("retry");
+            assert!(retry.status.success(), "retry: {retry:?}");
+            original.restore_dacl();
+        }
+    }
+}
+
+#[test]
+fn junction_prepares_the_target_and_preserves_its_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("directory");
+    let link = temp.path().join("junction");
+    fs::create_dir(&target).unwrap();
+    let owner = SavedAccess::capture(&target, 0).owner();
+    let out = Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    create_state_root(&link, &[]).unwrap();
+    assert_eq!(SavedAccess::capture(&target, 0).owner(), owner);
+    let saved = SavedAccess::capture(&target, 0);
+    assert_private_dacl(&saved);
+    assert!(target.join(STATE_ROOT_DURABLE_FILE).is_file());
+}
+
+fn assert_private_dacl(saved: &SavedAccess) {
+    let mut control = 0;
+    let mut revision = 0;
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(saved.descriptor, &mut control, &mut revision) },
+        0
+    );
+    assert_ne!(control & SE_DACL_PROTECTED, 0);
+    assert!(!saved.dacl.is_null());
+    assert_eq!(unsafe { (*saved.dacl).AceCount }, 1);
+    let mut ace = std::ptr::null_mut();
+    assert_ne!(unsafe { GetAce(saved.dacl, 0, &mut ace) }, 0);
+    let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+    assert_eq!(allowed.Header.AceType, 0);
+    assert_eq!(
+        allowed.Header.AceFlags,
+        (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8
+    );
+    assert_eq!(
+        allowed.Mask,
+        windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS
+    );
+    let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast();
+    assert_eq!(
+        crate::native::consent::windows_sid(sid).unwrap(),
+        crate::native::consent::windows_current_account()
+            .unwrap()
+            .owners[0]
+    );
+}

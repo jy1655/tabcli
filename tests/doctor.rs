@@ -1272,7 +1272,8 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "workspace_consent",
             "pi_follow_up",
             "pi_provider_credentials",
-            "shell_environment"
+            "shell_environment",
+            "state_root"
         ]
     );
     let human = fixture.run(&["doctor", "session-doctor"]);

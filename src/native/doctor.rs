@@ -369,6 +369,49 @@ fn terminal_selection_check(
     )
 }
 
+fn state_root_check() -> Check {
+    use crate::native::session::root_privacy::{self, Action, Mismatch};
+    let result = Reader::state_root().and_then(|root| root_privacy::check(&root, Action::Inspect));
+    let (availability, reason, detail, next_action) = match result {
+        Ok(_) => (
+            Availability::Available,
+            Reason::STATE_ROOT_PRIVATE,
+            "State root has private permissions.".to_owned(),
+            "No action is needed.",
+        ),
+        Err(e) if e.is::<Mismatch>() => (
+            Availability::Unavailable,
+            Reason::STATE_ROOT_NOT_PRIVATE,
+            format!("{e:#}"),
+            "Session creation attempts repair. If it fails, follow the reported remedy.",
+        ),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (
+                Availability::Unknown,
+                Reason::STATE_ROOT_ABSENT,
+                format!("{e:#}"),
+                "TAB creates it at the first session.",
+            )
+        }
+        Err(e) => (
+            Availability::Unknown,
+            Reason::STATE_ROOT_UNREADABLE,
+            format!("{e:#}"),
+            "Check access to the directory and its parents, then rerun doctor.",
+        ),
+    };
+    Check::new(
+        CheckId::STATE_ROOT,
+        availability,
+        reason,
+        detail,
+        next_action,
+    )
+}
+
 // Keep record reads and probes interleaved in their original order. record_checks
 // releases its snapshot before any surface or provider probe uses the shared deadline.
 fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnosis> {
@@ -614,6 +657,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         "probe_budget_ms": PROBE_TIMEOUT.as_millis(),
         "consent_state": consent_state,
     });
+    checks.push(state_root_check());
     Ok(Diagnosis {
         provider,
         manifest,

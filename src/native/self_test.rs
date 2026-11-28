@@ -5,7 +5,10 @@ use crate::native::failure_kind::{self, FailureKind};
 use crate::native::session::primitives::{
     STATE_DIR_ENV, require_valid_session_id, valid_session_id,
 };
-use crate::native::session::{Reader, RecordStore, Store};
+use crate::native::session::{
+    Reader, Store,
+    root_privacy::{self, FailurePolicy},
+};
 use crate::native::{AskRequest, NativeCommand, diagnostics, process_env, session_start};
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{checked_deadline_from, terminal_safe_text};
@@ -794,17 +797,29 @@ fn run_admitted(
         root
     } else {
         let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
         builder.prefix("agent-bridge-self-test-");
         let directory = match std::env::var_os(STATE_DIR_ENV) {
             Some(root) => {
-                fs::create_dir_all(&root)?;
+                let parent = Path::new(&root);
+                let created = crate::native::session::primitives::create_root_directories(
+                    parent,
+                    "the state root was created",
+                    FailurePolicy::Refuse,
+                )?;
+                if created {
+                    root_privacy::prepare(parent, true, FailurePolicy::Refuse)?;
+                }
                 builder.tempdir_in(root)?
             }
             None => builder.tempdir()?,
         };
-        let root = directory.keep();
-        RecordStore::at(&root).set_directory_private()?;
-        root
+        root_privacy::prepare(directory.path(), true, FailurePolicy::Refuse)?;
+        directory.keep()
     };
     let mut installed = Installed {
         executable: std::env::current_exe()?,

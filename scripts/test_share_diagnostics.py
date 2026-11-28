@@ -405,6 +405,16 @@ class ShareDiagnosticsTests(unittest.TestCase):
                                      [{"id": check_id, "availability": "unknown", "reason_code": reason}])
                     self.assert_private(summary)
 
+    def test_shared_summary_keeps_the_previous_24_checks_and_state_root(self):
+        source = doctor()
+        original = source["checks"][0]
+        source["checks"] = [original] * 24 + [
+            {"id": "state_root", "availability": "available", "reason_code": "state_root_private"}]
+        checks = self.parse(source)["summary"]["checks"]
+        self.assertEqual([row["id"] for row in checks["items"]], [original["id"]] * 24 + ["state_root"])
+        self.assertEqual((checks["input_count"], checks["included_count"], checks["omitted_count"]),
+                         (25, 25, 0))
+
     def test_doctor_duration_never_invents_time_or_uses_invalid_timestamps(self):
         for value, state in [(HOSTILE, "invalid"), (True, "invalid"),
                              (None, "null"), (-1, "invalid")]:

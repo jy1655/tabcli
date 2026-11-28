@@ -31,9 +31,10 @@ pub(in crate::native) use locks::{
 };
 #[allow(unused_imports)]
 pub(in crate::native) use state_root::{
-    StateRootDurabilityReceipt, create_directory, create_state_root, default_state_root,
-    home_directories, same_directory, session_directory, session_directory_in, state_root,
-    state_root_durability_receipt_present, sync_state_root_ancestry, validate_hook_directory,
+    StateRootDurabilityReceipt, create_directory, create_root_directories, create_state_root,
+    create_state_root_with, default_state_root, home_directories, same_directory,
+    session_directory, session_directory_in, state_root, state_root_durability_receipt_present,
+    sync_state_root_ancestry, validate_hook_directory,
 };
 
 pub(in crate::native) const STATE_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_STATE_DIR";

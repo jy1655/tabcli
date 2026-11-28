@@ -28,7 +28,8 @@ pub(in crate::native) use store::{
 #[cfg(windows)]
 pub(in crate::native) use store::{
     WindowsAccount, windows_current_account, windows_directory_is_private,
-    windows_directory_is_private_to, windows_process_account,
+    windows_directory_is_private_to, windows_owner_is_accepted, windows_process_account,
+    windows_sid,
 };
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,

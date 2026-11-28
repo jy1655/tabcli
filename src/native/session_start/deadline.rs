@@ -71,6 +71,7 @@ pub(in crate::native) fn open_lock(
 }
 
 /// Permission evidence is diagnostic only. Its absence must never prevent hardening.
+/// The root preparer verifies its own metadata and reports an actual repair directly.
 pub(in crate::native) fn set_permissions(
     path: &Path,
     fact: &'static str,

@@ -9,6 +9,8 @@
   fails when a record changed while it read. What it derives is marked: the request
   summaries are what `result` reports at the time of the query and carry `derived_from`.
   Do not add an entry for something no record holds.
+- Doctor's `state_root` row reads the selected root under the Session creator's privacy rule in
+  both report modes. The observation never creates or repairs the root.
 - Doctor's `terminal_selection` row reports the Surface `ask` would choose
   (`session_start::automatic_surface`), with the fallback as `evidence.fallback` inside hc. It
   opens no connection, so it never runs the caller check of an automatic Herdr choice. Where

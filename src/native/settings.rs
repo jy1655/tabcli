@@ -251,7 +251,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         [] => {}
         [MacosOpenMode::NAME, value] => {
             let value = value.parse::<MacosOpenMode>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.macos_open_mode = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
@@ -259,7 +259,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         }
         [WindowsTabWindow::NAME, value] => {
             let value = value.parse::<WindowsTabWindow>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.windows_tab_window = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
@@ -267,7 +267,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         }
         [CodexLifecycleHooks::NAME, value] => {
             let value = value.parse::<CodexLifecycleHooks>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.codex_lifecycle_hooks = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
@@ -275,7 +275,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         }
         [CodexMemoryWorkspace::NAME, value] => {
             let value = value.parse::<CodexMemoryWorkspace>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.codex_memory_workspace = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
@@ -283,7 +283,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         }
         [ClaudeQuestionDeflection::NAME, value] => {
             let value = value.parse::<ClaudeQuestionDeflection>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.claude_question_deflection = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
@@ -291,7 +291,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         }
         [CodexQuestionNotice::NAME, value] => {
             let value = value.parse::<CodexQuestionNotice>()?;
-            Store::create_state_root(root, &Reader::home_directories())?;
+            Store::create_settings_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.codex_question_notice = Some(value);
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
